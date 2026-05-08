@@ -47,18 +47,25 @@ function useNotifications() {
       const messaging = getFirebaseMessaging();
       if (!messaging) { initializedRef.current = false; return; }
 
-      const swParams = new URLSearchParams({
-        apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY ?? "",
-        authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN ?? "",
-        projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID ?? "",
-        storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET ?? "",
-        messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID ?? "",
-        appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID ?? "",
-      });
+      // Unregister any old SW registered with query params (legacy)
+      const existingRegs = await navigator.serviceWorker.getRegistrations();
+      for (const reg of existingRegs) {
+        const url = reg.active?.scriptURL ?? reg.installing?.scriptURL ?? "";
+        if (url.includes("firebase-messaging-sw") && url.includes("apiKey=")) {
+          await reg.unregister();
+        }
+      }
+
       const swReg = await navigator.serviceWorker.register(
-        `/firebase-messaging-sw.js?${swParams.toString()}`,
-        { scope: "/" },
+        "/firebase-messaging-sw.js",
+        { scope: "/", updateViaCache: "none" },
       );
+      await navigator.serviceWorker.ready;
+
+      // Clear any stale push subscription — mismatched VAPID keys cause AbortError
+      const existingSub = await swReg.pushManager.getSubscription();
+      if (existingSub) await existingSub.unsubscribe();
+
       const token = await getToken(messaging, {
         vapidKey: process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY,
         serviceWorkerRegistration: swReg,
@@ -70,15 +77,20 @@ function useNotifications() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ token }),
         });
+      } else {
+        console.error("[FCM] getToken returned null — check VAPID key and Firebase Messaging is enabled");
       }
 
-      // Show notification when tab is in the foreground
+      // Foreground message handler (tab is visible)
       onMessage(messaging, (payload) => {
         const title = payload.notification?.title ?? "Deepwrk";
         const body = payload.notification?.body ?? "";
         try { new Notification(title, { body, icon: "/favicon.svg" }); } catch { /* ignore */ }
       });
-    } catch { initializedRef.current = false; }
+    } catch (err) {
+      console.error("[FCM] init error:", err);
+      initializedRef.current = false;
+    }
   }, []);
 
   useEffect(() => {
@@ -96,16 +108,22 @@ function useNotifications() {
     return perm;
   }, [initFCM]);
 
-  // Sends via server → Firebase → SW (works even when tab is backgrounded/minimised)
+  // FCM push (background-capable) with native Notification fallback (foreground)
   const notify = useCallback((title: string, body: string, tag?: string) => {
     if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
     void fetch("/api/notifications/push", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title, body, tag }),
-    }).catch(() => {
-      try { new Notification(title, { body, icon: "/favicon.svg" }); } catch { /* ignore */ }
-    });
+    })
+      .then(async (res) => {
+        const data = await res.json() as { sent?: number };
+        // Fall back if no FCM tokens are registered yet
+        if (!data.sent) throw new Error("no-tokens");
+      })
+      .catch(() => {
+        try { new Notification(title, { body, icon: "/favicon.svg", tag }); } catch { /* ignore */ }
+      });
   }, []);
 
   return { permission, requestPermission, notify };
@@ -412,6 +430,57 @@ export default function FocusPage() {
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
   }, [state]);
+
+  // ── Session persistence (survive page refresh) ───────────────────────────────
+  const remainingSecondsRef = useRef(remainingSeconds);
+  useEffect(() => { remainingSecondsRef.current = remainingSeconds; }, [remainingSeconds]);
+  const sessionNotesRef = useRef(sessionNotes);
+  useEffect(() => { sessionNotesRef.current = sessionNotes; }, [sessionNotes]);
+
+  // Restore on mount
+  useEffect(() => {
+    const raw = localStorage.getItem("dwrk_session");
+    if (!raw) return;
+    try {
+      const s = JSON.parse(raw) as {
+        sessionId: string; taskTitle: string; plannedDuration: number;
+        totalSeconds: number; remainingSeconds: number; isRunning: boolean;
+        startTime: string | null; sessionNotes: string; savedAt: string;
+      };
+      let remaining = s.remainingSeconds;
+      if (s.isRunning && s.savedAt) {
+        const elapsed = Math.floor((Date.now() - new Date(s.savedAt).getTime()) / 1000);
+        remaining = Math.max(0, remaining - elapsed);
+      }
+      if (remaining <= 0) { localStorage.removeItem("dwrk_session"); return; }
+      setSessionId(s.sessionId);
+      setTaskTitle(s.taskTitle);
+      setPlannedDuration(s.plannedDuration);
+      setTotalSeconds(s.totalSeconds);
+      setRemainingSeconds(remaining);
+      setIsRunning(false); // always restore paused — user explicitly resumes
+      if (s.startTime) setStartTime(new Date(s.startTime));
+      setSessionNotes(s.sessionNotes ?? "");
+      setState("active");
+    } catch { localStorage.removeItem("dwrk_session"); }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Save every 15 s (heartbeat keeps savedAt accurate for elapsed-time calc on restore)
+  useEffect(() => {
+    if (state !== "active") { localStorage.removeItem("dwrk_session"); return; }
+    const doSave = () => localStorage.setItem("dwrk_session", JSON.stringify({
+      sessionId, taskTitle, plannedDuration, totalSeconds,
+      remainingSeconds: remainingSecondsRef.current,
+      isRunning,
+      startTime: startTime?.toISOString() ?? null,
+      sessionNotes: sessionNotesRef.current,
+      savedAt: new Date().toISOString(),
+    }));
+    doSave();
+    const id = setInterval(doSave, 15_000);
+    return () => clearInterval(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state, sessionId, taskTitle, plannedDuration, totalSeconds, isRunning, startTime]);
 
   // ── Start session ─────────────────────────────────────────────────────────────
   async function handleStartSession() {

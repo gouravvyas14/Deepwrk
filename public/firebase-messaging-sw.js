@@ -1,32 +1,30 @@
-// Firebase Messaging Service Worker
-// Config is injected via URL search params at registration time to avoid
-// hardcoding credentials in a static file.
-importScripts("https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js");
-importScripts("https://www.gstatic.com/firebasejs/10.12.5/firebase-messaging-compat.js");
+self.addEventListener("push", function (event) {
+  if (!event.data) return;
+  var payload = {};
+  try { payload = event.data.json(); } catch (e) { return; }
 
-const url = new URL(location.href);
-
-firebase.initializeApp({
-  apiKey: url.searchParams.get("apiKey"),
-  authDomain: url.searchParams.get("authDomain"),
-  projectId: url.searchParams.get("projectId"),
-  storageBucket: url.searchParams.get("storageBucket"),
-  messagingSenderId: url.searchParams.get("messagingSenderId"),
-  appId: url.searchParams.get("appId"),
-});
-
-const messaging = firebase.messaging();
-
-// Handle background (tab hidden / closed) push messages
-messaging.onBackgroundMessage((payload) => {
-  const title = payload.notification?.title ?? "Deepwrk";
-  const options = {
-    body: payload.notification?.body ?? "",
+  var title = (payload.notification && payload.notification.title) ? payload.notification.title : "Deepwrk";
+  var options = {
+    body: (payload.notification && payload.notification.body) ? payload.notification.body : "",
     icon: "/favicon.svg",
     badge: "/favicon.svg",
-    tag: payload.data?.tag ?? "deepwrk-notification",
-    data: payload.data,
-    requireInteraction: false,
+    tag: (payload.data && payload.data.tag) ? payload.data.tag : "deepwrk",
+    data: payload.data || {},
   };
-  self.registration.showNotification(title, options);
+
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+self.addEventListener("notificationclick", function (event) {
+  event.notification.close();
+  event.waitUntil(
+    clients.matchAll({ type: "window", includeUncontrolled: true }).then(function (list) {
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].url.indexOf("/focus") !== -1 && "focus" in list[i]) {
+          return list[i].focus();
+        }
+      }
+      return clients.openWindow("/focus");
+    })
+  );
 });
